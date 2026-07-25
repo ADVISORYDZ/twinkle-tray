@@ -676,25 +676,43 @@ getAllMonitors = async (ddcciMethod = "default", coreOnly = false) => {
             // A timed-out DDC scan must not trigger another DDC probe. Use the
             // standard luminance VCP as the high-level API's placeholder so
             // downstream feature and display-type handling remains valid.
-            const brightnessType = featureScanTimedOut
-                ? (canUseHighLevelBrightness ? 0x10 : false)
-                : await determineBrightnessVCPCode(id)
+            // Prefer a brightness VCP already found during feature probing.
+            let brightnessType = false
+            if (featureScanTimedOut) {
+                brightnessType = canUseHighLevelBrightness ? 0x10 : false
+            } else if (features?.["0x10"]) {
+                brightnessType = 0x10
+            } else if (features?.["0x13"]) {
+                brightnessType = 0x13
+            } else if (features?.["0x6B"] || features?.["0x6b"]) {
+                brightnessType = 0x6B
+            } else {
+                brightnessType = await determineBrightnessVCPCode(id)
+            }
+
+            // Fast/accurate validation has false negatives on flaky I2C buses.
+            // If a real brightness VCP responds, treat the display as controllable.
+            let isSupported = !!(ddcciSupported || highLevelSupported?.brightness)
+            if (!isSupported && brightnessType && brightnessType !== 0x12) {
+                console.log(`[DIAG] ${id}: driver marked unsupported, but brightness VCP ${vcpStr(brightnessType)} responded. Enabling.`)
+                isSupported = true
+            }
 
             let ddcciInfo = {
                 id: id,
                 key: hwid2,
                 hwid,
                 path,
-                ddcciSupported,
+                ddcciSupported: isSupported || ddcciSupported,
                 highLevelSupported,
                 features: features,
                 vcpCodes: vcpCodes,
                 featuresPending: !!coreOnly,
-                type: ((ddcciSupported || highLevelSupported?.brightness) && brightnessType ? "ddcci" : "none"),
+                type: (isSupported && brightnessType ? "ddcci" : "none"),
                 min: 0,
                 max: 100,
                 brightnessType: brightnessType,
-                brightnessValues: (features[brightnessType] ? features[brightnessType] : [50, 100])
+                brightnessValues: (features[vcpStr(brightnessType)] ? features[vcpStr(brightnessType)] : (features[brightnessType] ? features[brightnessType] : [50, 100]))
             }
 
             let brightness;
@@ -1215,9 +1233,26 @@ getFeaturesDDC = (ddcciMethod = "accurate", coreOnly = false) => {
                         monitorReports[id] = monitor.capabilities
                     }
 
-                    if(monitor.ddcciSupported && !coreOnly && !shouldAbortFeatureScan()) {
+                    let ddcciSupportedFlag = !!monitor.ddcciSupported
+
+                    if(ddcciSupportedFlag && !coreOnly && !shouldAbortFeatureScan()) {
                         await wait(10)
                         features = await checkMonitorFeatures(id, false, ddcciMethod, shouldAbortFeatureScan)
+                    } else if (!ddcciSupportedFlag && !coreOnly && !shouldAbortFeatureScan()) {
+                        // Validation failed, but some flaky monitors still answer
+                        // luminance VCP after a few retries. Probe brightness codes only.
+                        await wait(100)
+                        features["0x10"] = await checkVCP(id, 0x10, false, true, 8)
+                        if (!features["0x10"] && !shouldAbortFeatureScan()) {
+                            features["0x13"] = await checkVCP(id, 0x13, false, true, 6)
+                        }
+                        if (!features["0x10"] && !features["0x13"] && !shouldAbortFeatureScan()) {
+                            features["0x6B"] = await checkVCP(id, 0x6B, false, true, 4)
+                        }
+                        if (features["0x10"] || features["0x13"] || features["0x6B"]) {
+                            console.log(`[DIAG] ${id}: VCP brightness responded after failed DDC validation. Enabling.`)
+                            ddcciSupportedFlag = true
+                        }
                     }
 
                     // Do not alter the collection after the global timeout has
@@ -1229,7 +1264,7 @@ getFeaturesDDC = (ddcciMethod = "accurate", coreOnly = false) => {
                         hwid,
                         features,
                         featureScanTimedOut: featureTimedOut,
-                        ddcciSupported: monitor.ddcciSupported,
+                        ddcciSupported: ddcciSupportedFlag,
                         highLevelSupported: {
                             brightness: monitor.hlBrightnessSupported,
                             contrast: monitor.hlContrastSupported
@@ -1543,7 +1578,9 @@ async function checkVCPIfEnabled(monitor, code, setting, skipCache = false) {
         // If we previously saw that a feature was supported, we shouldn't have to check again.
         if ((!skipCache || !userEnabledFeature) && vcpCache[monitor] && vcpCache[monitor]["vcp_" + vcpString]) return vcpCache[monitor]["vcp_" + vcpString];
 
-        const vcpResult = await checkVCP(monitor, code)
+        const codeInt = parseInt(code)
+        const retries = (codeInt === 0x10 || codeInt === 0x13 || codeInt === 0x6B) ? 6 : 1
+        const vcpResult = await checkVCP(monitor, code, false, true, retries)
         return vcpResult
     } catch (e) {
         console.log(`Error reading VCP code (if enabled) ${vcpString} for ${monitor}`, e)
@@ -1578,52 +1615,105 @@ async function checkIfVCPSupported(monitor, code) {
     }
 }
 
-async function checkVCP(monitor, code, skipCacheWrite = false, useCachedOnError = true) {
+// Extra JS-level retries on top of native tryDdcCiOperation (3x/50ms).
+// Some DisplayPort monitors need more attempts than the native layer alone.
+const TRANSIENT_DDC_CODES = new Set([
+    0xC0262582, // I2C transmit
+    0xC0262583, // I2C receive
+    0xC0262585, // invalid data
+    0xC0262586, // invalid timing status
+    0xC0262589, // invalid message command
+    0xC026258A, // invalid message length
+    0xC026258B  // invalid checksum
+])
+
+function isTransientDDCError(e) {
+    const code = e?.win32Code >>> 0
+    if (TRANSIENT_DDC_CODES.has(code)) return true
+    const reason = classifyDDCError(e)
+    if (typeof reason === "string" && (
+        reason.indexOf("I2C bus error") >= 0 ||
+        reason.indexOf("invalid DDC/CI") >= 0 ||
+        reason.indexOf("invalid timing") >= 0 ||
+        reason.indexOf("invalid data") >= 0
+    )) return true
+    return false
+}
+
+async function checkVCP(monitor, code, skipCacheWrite = false, useCachedOnError = true, maxAttempts = 1) {
     const vcpString = vcpStr(code)
     if(!code || code == "0x0") return false;
-    try {
-        let result = ddcci._getVCP(monitor, parseInt(vcpString))
-        if (code === 96) return ddcci.getMonitorInputs(monitor)
-        if (!skipCacheWrite) {
-            if (!vcpCache[monitor]) vcpCache[monitor] = {};
-            vcpCache[monitor]["vcp_" + vcpString] = result
-        }
-        if(settings.debugForceBrightnessMax && vcpString == "0x10") result[1] = settings.debugForceBrightnessMax; // Force lower max brightness for testing
-        await wait(parseInt(settings?.checkVCPWaitMS || 20))
-        return result
-    } catch (e) {
-        console.log(`Error reading VCP code ${vcpString} for ${monitor}. Reason: ${classifyDDCError(e)}`)
 
-        // Since it failed, let's check for an existing value first
-        if(useCachedOnError && vcpCache[monitor]?.["vcp_" + vcpString]) {
-            return vcpCache[monitor]["vcp_" + vcpString]
+    const attempts = Math.max(1, parseInt(maxAttempts) || 1)
+    const baseWait = parseInt(settings?.checkVCPWaitMS || 20)
+    let lastError = null
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+            let result = ddcci._getVCP(monitor, parseInt(vcpString))
+            if (code === 96) return ddcci.getMonitorInputs(monitor)
+            if (!skipCacheWrite) {
+                if (!vcpCache[monitor]) vcpCache[monitor] = {};
+                vcpCache[monitor]["vcp_" + vcpString] = result
+            }
+            if(settings.debugForceBrightnessMax && vcpString == "0x10") result[1] = settings.debugForceBrightnessMax; // Force lower max brightness for testing
+            await wait(baseWait)
+            if (attempt > 1) {
+                console.log(`VCP ${vcpString} for ${monitor} succeeded on JS attempt ${attempt}/${attempts}`)
+            }
+            return result
+        } catch (e) {
+            lastError = e
+            if (!isTransientDDCError(e) || attempt >= attempts) break
+            await wait(baseWait + (attempt * 80))
         }
-        
-        // Cached value can't be used, so we return false
-        return false
     }
+
+    if (lastError) {
+        console.log(`Error reading VCP code ${vcpString} for ${monitor}. Reason: ${classifyDDCError(lastError)}`)
+    }
+
+    // Since it failed, let's check for an existing value first
+    if(useCachedOnError && vcpCache[monitor]?.["vcp_" + vcpString]) {
+        return vcpCache[monitor]["vcp_" + vcpString]
+    }
+
+    // Cached value can't be used, so we return false
+    return false
 }
 
 async function setVCP(monitor, code, value) {
     if(busyLevel > 0) while(busyLevel > 0) { await wait(100) } // Wait until no longer busy
-    try {
-        const vcpString = vcpStr(code)
-        let result = ddcci._setVCP(monitor, code, (value * 1))
-        if (vcpCache[monitor]?.["vcp_" + vcpString]) {
-            vcpCache[monitor]["vcp_" + vcpString][0] = (value * 1)
+    const vcpString = vcpStr(code)
+    const attempts = 5
+    const baseWait = parseInt(settings?.checkVCPWaitMS || 20)
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+            let result = ddcci._setVCP(monitor, code, (value * 1))
+            if (vcpCache[monitor]?.["vcp_" + vcpString]) {
+                vcpCache[monitor]["vcp_" + vcpString][0] = (value * 1)
+            }
+
+            const hwid = monitor.split("#")
+            const updatedMonitor = monitors[hwid[2]]
+            if(updatedMonitor?.features?.[vcpString]) {
+                updatedMonitor.features[vcpString][0] = parseInt(value)
+                saveFeatureSnapshot(updatedMonitor)
+            }
+            if (attempt > 1) {
+                console.log(`setVCP ${vcpString}=${value} for ${monitor} succeeded on attempt ${attempt}`)
+            }
+            return result
+        } catch (e) {
+            if (!isTransientDDCError(e) || attempt >= attempts) {
+                console.log(`Error setting VCP code ${vcpString} for ${monitor}. Reason: ${classifyDDCError(e)}`)
+                return false
+            }
+            await wait(baseWait + (attempt * 80))
         }
-        
-        const hwid = monitor.split("#")
-        const updatedMonitor = monitors[hwid[2]]
-        if(updatedMonitor?.features?.[vcpString]) {
-            updatedMonitor.features[vcpString][0] = parseInt(value)
-            saveFeatureSnapshot(updatedMonitor)
-        }
-        return result
-    } catch (e) {
-        console.log(`Error setting VCP code ${vcpStr(code)} for ${monitor}. Reason: ${classifyDDCError(e)}`)
-        return false
     }
+    return false
 }
 
 async function getHighLevelBrightness(monitor) {   
